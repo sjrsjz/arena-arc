@@ -2,6 +2,12 @@
 name = "arena-arc"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, chunk-based allocator for building contiguous slices and sharing them via handles"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/sjrsjz/arena-arc"
+homepage = "https://github.com/sjrsjz/arena-arc"
+documentation = "https://docs.rs/arena-arc"
 
 [dependencies]
 
