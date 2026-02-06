@@ -16,7 +16,7 @@
 //!
 //! # Example
 //! ```
-//! use arc_slice::Allocator;
+//! use arena_arc::Allocator;
 //!
 //! let mut allocator: Allocator<u32, u32, 16> = Allocator::new();
 //! let handle = allocator.alloc(4, |i| (i * 2) as u32);

@@ -1,4 +1,4 @@
-use arc_slice::Allocator;
+use arena_arc::Allocator;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ fn bench_allocs(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("arc_slice", len), &len, |b, &len| {
+        group.bench_with_input(BenchmarkId::new("arena_arc", len), &len, |b, &len| {
             b.iter(|| {
                 let mut arc = Arc::<[u64]>::new_uninit_slice(len);
                 let data = Arc::get_mut(&mut arc).expect("unique during init");

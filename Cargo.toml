@@ -1,5 +1,5 @@
 [package]
-name = "arc-slice"
+name = "arena-arc"
 version = "0.1.0"
 edition = "2024"
 

@@ -1,4 +1,4 @@
-# arc-slice
+# arena-arc
 
 A fast, chunk-based allocator for building contiguous slices and sharing them via handles.
 It is designed for high-frequency, short-lived allocations where allocating each slice
@@ -19,7 +19,7 @@ share the underlying buffer.
 ## Quick start
 
 ```rust
-use arc_slice::Allocator;
+use arena_arc::Allocator;
 
 let mut allocator: Allocator<u32, u32, 16> = Allocator::new();
 let handle = allocator.alloc(4, |i| (i * 2) as u32);
