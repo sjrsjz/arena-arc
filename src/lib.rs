@@ -16,18 +16,26 @@
 //!
 //! # Example
 //! ```
-//! use fast_allocator::Allocator;
+//! use arc_slice::Allocator;
 //!
 //! let mut allocator: Allocator<u32, u32, 16> = Allocator::new();
 //! let handle = allocator.alloc(4, |i| (i * 2) as u32);
 //! assert_eq!(handle.get(), &[0, 2, 4, 6]);
 //! ```
-use std::{cell::UnsafeCell, mem::MaybeUninit, ptr::NonNull, sync::atomic::AtomicUsize};
+use std::{
+    cell::UnsafeCell, fmt::Debug, mem::MaybeUninit, ops::Deref, ptr::NonNull,
+    sync::atomic::AtomicUsize,
+};
 /// Trait bound for index types used by [`Handle`] and [`Allocator`].
 ///
 /// Must be convertible to and from `usize` with debug-friendly errors.
 pub trait IndexType:
-    Copy + TryFrom<usize, Error: std::fmt::Debug> + TryInto<usize, Error: std::fmt::Debug>
+    Copy
+    + TryFrom<usize, Error: std::fmt::Debug>
+    + TryInto<usize, Error: std::fmt::Debug>
+    + PartialEq
+    + Eq
+    + Debug
 {
 }
 impl IndexType for u16 {}
@@ -165,7 +173,8 @@ impl<T> ChunkRef<T> {
 /// A read-only handle to a slice allocated from an [`Allocator`].
 ///
 /// Cloning a handle is cheap and shares the underlying buffer.
-pub struct SliceArc<T, L: IndexType = u32> {
+/// The slice remains valid as long as any handle referencing the same chunk exists.
+pub struct ArcSlice<T, L: IndexType = u32> {
     // A pointer to the buffer that this handle is allocated from.
     chunk: ChunkRef<T>,
     // The index of the item in the buffer that this handle points to.
@@ -174,10 +183,10 @@ pub struct SliceArc<T, L: IndexType = u32> {
     len: L,
 }
 
-unsafe impl<T, L: IndexType> Send for SliceArc<T, L> where T: Send + Sync {}
-unsafe impl<T, L: IndexType> Sync for SliceArc<T, L> where T: Send + Sync {}
+unsafe impl<T, L: IndexType> Send for ArcSlice<T, L> where T: Send + Sync {}
+unsafe impl<T, L: IndexType> Sync for ArcSlice<T, L> where T: Send + Sync {}
 
-impl<T, L: IndexType> Clone for SliceArc<T, L> {
+impl<T, L: IndexType> Clone for ArcSlice<T, L> {
     fn clone(&self) -> Self {
         Self {
             chunk: self.chunk.clone(),
@@ -187,7 +196,10 @@ impl<T, L: IndexType> Clone for SliceArc<T, L> {
     }
 }
 
-impl<T, L: IndexType> SliceArc<T, L> {
+impl<T, L: IndexType> ArcSlice<T, L> {
+    /// Returns the underlying slice.
+    ///
+    /// This is zero-copy and only creates a shared reference into the backing chunk.
     pub fn get(&self) -> &[T] {
         unsafe {
             let buffer = self.chunk.buffer();
@@ -207,6 +219,98 @@ impl<T, L: IndexType> SliceArc<T, L> {
     }
 }
 
+impl<T, L: IndexType> Deref for ArcSlice<T, L> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+pub struct ArcSingle<T, L: IndexType = u32> {
+    chunk: ChunkRef<T>,
+    index: L,
+}
+
+unsafe impl<T, L: IndexType> Send for ArcSingle<T, L> where T: Send + Sync {}
+unsafe impl<T, L: IndexType> Sync for ArcSingle<T, L> where T: Send + Sync {}
+
+impl<T, L: IndexType> Clone for ArcSingle<T, L> {
+    fn clone(&self) -> Self {
+        Self {
+            chunk: self.chunk.clone(),
+            index: self.index,
+        }
+    }
+}
+
+impl<T, L: IndexType> ArcSingle<T, L> {
+    /// Returns the referenced item.
+    ///
+    /// This is zero-copy and only creates a shared reference into the backing chunk.
+    pub fn get(&self) -> &T {
+        unsafe {
+            let buffer = self.chunk.buffer();
+            let data = &*buffer.data.get();
+            let start = self
+                .index
+                .try_into()
+                .expect("Index exceeds index type capacity");
+            let slice = &data[start];
+            // SAFETY: The data in this range has been initialized by the allocator
+            std::mem::transmute::<&MaybeUninit<T>, &T>(slice)
+        }
+    }
+
+    /// Creates an [`ArcSingle`] from an [`ArcSlice`] of length 1.
+    ///
+    /// # Panics
+    /// Panics if the slice length is not 1.
+    pub fn from_slice(handle: ArcSlice<T, L>) -> Self {
+        assert_eq!(
+            handle.len,
+            1.try_into().expect("Length exceeds index type capacity"),
+            "ArcSingle can only be created from a slice of length 1"
+        );
+        Self {
+            chunk: handle.chunk.clone(),
+            index: handle.index,
+        }
+    }
+}
+
+impl<T, L: IndexType> Deref for ArcSingle<T, L> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl<T, L: IndexType> TryFrom<ArcSlice<T, L>> for ArcSingle<T, L> {
+    type Error = &'static str;
+
+    fn try_from(value: ArcSlice<T, L>) -> Result<Self, Self::Error> {
+        if value.len != 1.try_into().expect("Length exceeds index type capacity") {
+            return Err("ArcSingle can only be created from a slice of length 1");
+        }
+        Ok(Self {
+            chunk: value.chunk,
+            index: value.index,
+        })
+    }
+}
+
+impl<T, L: IndexType> From<ArcSingle<T, L>> for ArcSlice<T, L> {
+    fn from(value: ArcSingle<T, L>) -> Self {
+        Self {
+            chunk: value.chunk,
+            index: value.index,
+            len: 1.try_into().expect("Length exceeds index type capacity"),
+        }
+    }
+}
+
 /// Chunk-based allocator for variable-length slices.
 ///
 /// - `T`: element type.
@@ -221,7 +325,7 @@ impl<T, L: IndexType, const N: usize> std::fmt::Debug for Allocator<T, L, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Allocator<{}, {}, {}>",
+            "Allocator<T={}, L={}, N={}>",
             std::any::type_name::<T>(),
             std::any::type_name::<L>(),
             N
@@ -247,7 +351,7 @@ impl<T, L: IndexType, const N: usize> Allocator<T, L, N> {
     /// Allocate a slice of length `len` and initialize elements with `init`.
     ///
     /// Returns a [`Handle`] that can be cheaply cloned.
-    pub fn alloc<F>(&mut self, len: L, mut init: F) -> SliceArc<T, L>
+    pub fn alloc<F>(&mut self, len: L, mut init: F) -> ArcSlice<T, L>
     where
         F: FnMut(usize) -> T,
     {
@@ -269,7 +373,7 @@ impl<T, L: IndexType, const N: usize> Allocator<T, L, N> {
                     .alloc_index
                     .store(len, std::sync::atomic::Ordering::Release);
             }
-            return SliceArc {
+            return ArcSlice {
                 chunk,
                 index: 0
                     .try_into()
@@ -297,7 +401,7 @@ impl<T, L: IndexType, const N: usize> Allocator<T, L, N> {
                 // 如果当前chunk剩余空间不足以分配请求的长度，但重分配新的chunk再填充的剩余空间比比self持有的剩余空间更大，则直接丢弃当前chunk，使用新的chunk。
                 self.chunk = chunk.clone();
             }
-            return SliceArc {
+            return ArcSlice {
                 chunk,
                 index: 0
                     .try_into()
@@ -330,12 +434,164 @@ impl<T, L: IndexType, const N: usize> Allocator<T, L, N> {
                 .header
                 .alloc_index
                 .store(index + len, std::sync::atomic::Ordering::Release);
-            SliceArc {
+            ArcSlice {
                 chunk: self.chunk.clone(),
                 index: index.try_into().expect("Index cap"),
                 len: len.try_into().expect("Length cap"),
             }
         }
+    }
+
+    /// Allocate a slice with fallible initialization.
+    ///
+    /// The `init` function can return an error to indicate initialization failure.
+    /// In that case, any already-initialized elements will be dropped and the error will be returned.
+    pub fn try_alloc<F, E>(&mut self, len: L, mut init: F) -> Result<ArcSlice<T, L>, E>
+    where
+        F: FnMut(usize) -> Result<T, E>,
+    {
+        let len: usize = len.try_into().expect("Length exceeds index type capacity");
+        let left_space = unsafe { self.chunk.buffer().left_space() };
+        if N < len {
+            // 如果请求的长度超过了chunk的容量，直接分配一个新的chunk，但不改变当前chunk的状态，以便后续的分配仍然可以使用当前chunk。
+            let chunk: ChunkRef<T> = ChunkRef::new(len);
+            unsafe {
+                let buffer = chunk.buffer(); // 我们可以保证这个chunk是唯一的，所以可以安全地获取可变引用
+                // 使用FnOnce初始化chunk的数据
+                let data = &mut *buffer.data.get();
+                for (i, item) in data.iter_mut().take(len).enumerate() {
+                    match init(i) {
+                        Ok(val) => item.as_mut_ptr().write(val),
+                        Err(e) => {
+                            // 初始化失败，清理已初始化的元素并返回错误
+                            for item in data.iter_mut().take(i) {
+                                item.assume_init_drop();
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                // 更新chunk的分配索引
+                buffer
+                    .header
+                    .alloc_index
+                    .store(len, std::sync::atomic::Ordering::Release);
+            }
+            return Ok(ArcSlice {
+                chunk,
+                index: 0
+                    .try_into()
+                    .expect("Index 0 should be valid for any index type"),
+                len: len.try_into().expect("Length exceeds index type capacity"),
+            });
+        }
+        if left_space < len {
+            // 如果当前chunk剩余空间不足以分配请求的长度
+            let chunk: ChunkRef<T> = ChunkRef::new(N);
+            unsafe {
+                let buffer = chunk.buffer(); // 我们可以保证这个chunk是唯一的，所以可以安全地获取可变引用
+                // 使用FnOnce初始化chunk的数据
+                let data = &mut *buffer.data.get();
+                for (i, item) in data.iter_mut().take(len).enumerate() {
+                    match init(i) {
+                        Ok(val) => item.as_mut_ptr().write(val),
+                        Err(e) => {
+                            // 初始化失败，清理已初始化的元素并返回错误
+                            for item in data.iter_mut().take(i) {
+                                item.assume_init_drop();
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                // 更新chunk的分配索引
+                buffer
+                    .header
+                    .alloc_index
+                    .store(len, std::sync::atomic::Ordering::Release);
+            }
+            if left_space < N - len {
+                // 如果当前chunk剩余空间不足以分配请求的长度，但重分配新的chunk再填充的剩余空间比比self持有的剩余空间更大，则直接丢弃当前chunk，使用新的chunk。
+                self.chunk = chunk.clone();
+            }
+            return Ok(ArcSlice {
+                chunk,
+                index: 0
+                    .try_into()
+                    .expect("Index 0 should be valid for any index type"),
+                len: len.try_into().expect("Length exceeds index type capacity"),
+            });
+        }
+        // 如果当前chunk剩余空间足以分配请求的长度
+        unsafe {
+            let buffer = self.chunk.buffer();
+
+            // 1. 读取 index
+            let index = buffer
+                .header
+                .alloc_index
+                .load(std::sync::atomic::Ordering::Relaxed);
+
+            // 2. 使用裸指针写入，避免创建 &mut [T]
+            // 获取 *mut [MaybeUninit<T>] -> *mut MaybeUninit<T>
+            let base_ptr = (*buffer.data.get()).as_mut_ptr();
+
+            for i in 0..len {
+                // init(i) 可能会 panic，但这在这里是安全的（Leak on panic）
+                match init(i) {
+                    // ptr::write 只操作特定地址，不产生大范围的引用别名限制
+                    Ok(val) => base_ptr.add(index + i).write(MaybeUninit::new(val)),
+                    Err(e) => {
+                        // 初始化失败，清理已初始化的元素并返回错误
+                        for j in 0..i {
+                            std::ptr::drop_in_place(base_ptr.add(index + j) as *mut T);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            // 3. 提交 index
+            buffer
+                .header
+                .alloc_index
+                .store(index + len, std::sync::atomic::Ordering::Release);
+            Ok(ArcSlice {
+                chunk: self.chunk.clone(),
+                index: index.try_into().expect("Index cap"),
+                len: len.try_into().expect("Length cap"),
+            })
+        }
+    }
+
+    /// Allocate a single element and return it as an [`ArcSingle`].
+    pub fn alloc_single<F>(&mut self, init: F) -> ArcSingle<T, L>
+    where
+        F: FnOnce() -> T,
+    {
+        let mut init = Some(init);
+        let slice = self.alloc(
+            1.try_into().expect("Length exceeds index type capacity"),
+            |_| init.take().expect("init called more than once")(),
+        );
+        ArcSingle::from_slice(slice)
+    }
+
+    /// Allocate a single element with fallible initialization and return it as an [`ArcSingle`].
+    pub fn try_alloc_single<F, E>(&mut self, init: F) -> Result<ArcSingle<T, L>, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        let mut init = Some(init);
+        self.try_alloc(
+            1.try_into().expect("Length exceeds index type capacity"),
+            |_| init.take().expect("init called more than once")(),
+        )
+        .map(ArcSingle::from_slice)
+    }
+
+    /// Allocate a single element from an existing value.
+    pub fn alloc_value(&mut self, value: T) -> ArcSingle<T, L> {
+        self.alloc_single(|| value)
     }
 }
 
