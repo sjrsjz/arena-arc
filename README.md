@@ -1,14 +1,22 @@
 # arc-slice
 
-一个针对类似 `Arc<[T]>` 的基于 chunk 的快速分配器，用于分配连续切片并通过句柄共享数据。适合高频短生命周期分配场景，避免频繁单独分配与释放。
+A fast, chunk-based allocator for building contiguous slices and sharing them via handles.
+It is designed for high-frequency, short-lived allocations where allocating each slice
+individually would be too expensive.
 
-## 特性
+This crate provides an `Allocator` that allocates variable-length slices from a pre-allocated
+chunk and returns zero-copy handles (`ArcSlice` / `ArcSingle`). Handles are cheap to clone and
+share the underlying buffer.
 
-- 通过单个 chunk 分配多个切片
-- 句柄可低成本克隆，数据零拷贝共享
-- 支持可配置 chunk 容量与索引类型
+## Features
 
-## 快速开始
+- Allocate many slices from a single chunk
+- Cheap handle cloning with zero-copy sharing
+- Configurable chunk capacity and index type
+- Optional fallible initialization (`try_alloc`)
+- Single-item handles (`ArcSingle`) for ergonomic access
+
+## Quick start
 
 ```rust
 use arc_slice::Allocator;
@@ -18,26 +26,66 @@ let handle = allocator.alloc(4, |i| (i * 2) as u32);
 assert_eq!(handle.get(), &[0, 2, 4, 6]);
 ```
 
-## 安全性与行为说明
+## API overview
 
-- **僵尸对象**：某个切片不再使用，但同一 chunk 仍被其他句柄持有时，该切片占用的内存不会被单独回收，直到整个 chunk 被释放。
-- **额外内存占用**：chunk 以固定容量分配，可能存在未使用空间；当空间不足时会创建新 chunk，旧 chunk 的剩余空间会成为额外占用。
-- **Drop 推迟**：元素的 `Drop` 只在最后一个持有该 chunk 的句柄释放后发生，不是逐元素即时释放。
+### `Allocator<T, L, N>`
 
-## 基准测试
+- `T`: element type
+- `L`: index type used for offsets (defaults to `u32`)
+- `N`: default chunk capacity (const generic)
 
-项目提供与标准库 `Arc<[T]>` 的分配对比基准。
+Common methods:
+
+- `new()`: create a new allocator with a single chunk of capacity `N`
+- `alloc(len, init)`: allocate a slice of length `len` and initialize each element via `init`
+- `try_alloc(len, init)`: same as `alloc`, but allows returning an error
+- `alloc_single(init)`: allocate one element and return an `ArcSingle`
+- `alloc_value(value)`: allocate one element from an existing value
+
+### `ArcSlice<T, L>`
+
+Read-only handle to a slice allocated from an `Allocator`.
+
+- `get() -> &[T]`: borrow the slice (zero-copy)
+- `clone()`: cheap, shared handle clone
+
+### `ArcSingle<T, L>`
+
+Read-only handle to a single element.
+
+- `get() -> &T`: borrow the element (zero-copy)
+- `from_slice(handle)`: convert an `ArcSlice` of length 1 into an `ArcSingle`
+
+## Safety and behavior notes
+
+- **Zombie objects**: If a slice is no longer used while other handles keep the same chunk alive,
+	that slice’s memory is not reclaimed individually. It is only reclaimed when the entire chunk
+	is freed.
+- **Extra memory overhead**: Chunks are allocated with fixed capacity `N`. When a request exceeds
+	remaining space, a new chunk is allocated and the unused tail of the old chunk becomes overhead.
+- **Deferred drops**: Elements are dropped only when the last handle for a chunk is released, so
+	per-element drop does not happen immediately.
+
+## When to use
+
+- Building many short-lived slices with similar lifetimes
+- Sharing read-only data across multiple owners without copying
+- Avoiding per-slice heap allocations
+
+## Benchmarks
+
+Benchmarks compare against `Arc<[T]>` allocations.
 
 ```bash
 cargo bench --bench alloc_bench
 ```
 
-## Miri 检查
+## Miri checks
 
 ```bash
 cargo +nightly miri test
 ```
 
-## 许可证
+## License
 
 MIT
