@@ -65,6 +65,17 @@ struct Buffer<T> {
 }
 
 impl<T> Buffer<T> {
+    fn layout_for_capacity(capacity: usize) -> std::alloc::Layout {
+        // Layout must match the allocation in ChunkRef::new.
+        let header_layout = std::alloc::Layout::new::<Header>();
+        let array_layout = std::alloc::Layout::array::<MaybeUninit<T>>(capacity)
+            .expect("Failed to create array layout for buffer data");
+        let (layout, _offset) = header_layout
+            .extend(array_layout)
+            .expect("Failed to extend header layout with data layout");
+        layout
+    }
+
     fn left_space(&self) -> usize {
         self.header.capacity
             - self
@@ -95,13 +106,16 @@ impl<T> Drop for Buffer<T> {
 ///
 /// This is an internal building block used by [`Handle`] and [`Allocator`].
 struct ChunkRef<T> {
-    inner: NonNull<Buffer<T>>,
+    inner: Option<NonNull<Buffer<T>>>,
 }
 
 impl<T> Clone for ChunkRef<T> {
     fn clone(&self) -> Self {
+        if self.inner.is_none() {
+            return Self { inner: None };
+        }
         // Increment the reference count of the buffer.
-        let buffer = unsafe { self.inner.as_ref() };
+        let buffer = unsafe { self.inner.as_ref().unwrap().as_ref() };
         buffer
             .header
             .ref_count
@@ -112,8 +126,12 @@ impl<T> Clone for ChunkRef<T> {
 
 impl<T> Drop for ChunkRef<T> {
     fn drop(&mut self) {
+        if self.inner.is_none() {
+            return;
+        }
+        let inner_ref = self.inner.as_ref().unwrap();
         // Decrement the reference count of the buffer.
-        let buffer = unsafe { self.inner.as_ref() };
+        let buffer = unsafe { inner_ref.as_ref() };
         if buffer
             .header
             .ref_count
@@ -122,9 +140,9 @@ impl<T> Drop for ChunkRef<T> {
         {
             // SAFETY: We are the last owner of the buffer, so it is safe to deallocate it.
             unsafe {
-                let layout = std::alloc::Layout::for_value(self.inner.as_ref());
-                std::ptr::drop_in_place(self.inner.as_ptr());
-                std::alloc::dealloc(self.inner.as_ptr() as *mut u8, layout);
+                let layout = Buffer::<T>::layout_for_capacity(buffer.header.capacity);
+                std::ptr::drop_in_place(inner_ref.as_ptr());
+                std::alloc::dealloc(inner_ref.as_ptr() as *mut u8, layout);
             }
         }
     }
@@ -133,12 +151,7 @@ impl<T> Drop for ChunkRef<T> {
 impl<T> ChunkRef<T> {
     fn new(capacity: usize) -> Self {
         // SAFETY: We create a layout for the header and the data array.
-        let header_layout = std::alloc::Layout::new::<Header>();
-        let array_layout = std::alloc::Layout::array::<MaybeUninit<T>>(capacity)
-            .expect("Failed to create array layout for buffer data");
-        let (layout, _offset) = header_layout
-            .extend(array_layout)
-            .expect("Failed to extend header layout with data layout");
+        let layout = Buffer::<T>::layout_for_capacity(capacity);
 
         let ptr = unsafe { std::alloc::alloc(layout) };
         if ptr.is_null() {
@@ -161,12 +174,25 @@ impl<T> ChunkRef<T> {
         }
 
         Self {
-            inner: NonNull::new(ptr).expect("Failed to create NonNull pointer"),
+            inner: Some(NonNull::new(ptr).expect("Failed to create NonNull pointer")),
         }
     }
 
     unsafe fn buffer(&self) -> &Buffer<T> {
-        unsafe { self.inner.as_ref() }
+        unsafe {
+            self.inner
+                .as_ref()
+                .expect("Dereferenced null chunk")
+                .as_ref()
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    fn null() -> Self {
+        Self { inner: None }
     }
 }
 
@@ -201,6 +227,10 @@ impl<T, L: IndexType> ArcSlice<T, L> {
     ///
     /// This is zero-copy and only creates a shared reference into the backing chunk.
     pub fn get(&self) -> &[T] {
+        if self.chunk.is_null() {
+            // For zero-length allocations, we return a reference to an empty slice without accessing the chunk.
+            return &[];
+        }
         unsafe {
             let buffer = self.chunk.buffer();
             let data = &*buffer.data.get();
@@ -215,6 +245,19 @@ impl<T, L: IndexType> ArcSlice<T, L> {
             let slice = &data[start..start + len];
             // SAFETY: The data in this range has been initialized by the allocator
             std::mem::transmute::<&[MaybeUninit<T>], &[T]>(slice)
+        }
+    }
+
+    /// Creates an empty slice handle that points to an empty slice without modifying the chunk.
+    pub fn empty() -> Self {
+        Self {
+            chunk: ChunkRef::null(),
+            index: 0
+                .try_into()
+                .expect("Index 0 should be valid for any index type"),
+            len: 0
+                .try_into()
+                .expect("Length 0 should be valid for any index type"),
         }
     }
 }
@@ -355,6 +398,18 @@ impl<T, L: IndexType, const N: usize> Allocator<T, L, N> {
     where
         F: FnMut(usize) -> T,
     {
+        if len == 0.try_into().expect("Length exceeds index type capacity") {
+            // For zero-length allocations, we can return a handle that points to an empty slice without modifying the chunk.
+            return ArcSlice {
+                chunk: ChunkRef::null(),
+                index: 0
+                    .try_into()
+                    .expect("Index 0 should be valid for any index type"),
+                len: 0
+                    .try_into()
+                    .expect("Length 0 should be valid for any index type"),
+            };
+        }
         let len: usize = len.try_into().expect("Length exceeds index type capacity");
         let left_space = unsafe { self.chunk.buffer().left_space() };
         if N < len {
@@ -450,6 +505,18 @@ impl<T, L: IndexType, const N: usize> Allocator<T, L, N> {
     where
         F: FnMut(usize) -> Result<T, E>,
     {
+        if len == 0.try_into().expect("Length exceeds index type capacity") {
+            // For zero-length allocations, we can return a handle that points to an empty slice without modifying the chunk.
+            return Ok(ArcSlice {
+                chunk: ChunkRef::null(),
+                index: 0
+                    .try_into()
+                    .expect("Index 0 should be valid for any index type"),
+                len: 0
+                    .try_into()
+                    .expect("Length 0 should be valid for any index type"),
+            });
+        }
         let len: usize = len.try_into().expect("Length exceeds index type capacity");
         let left_space = unsafe { self.chunk.buffer().left_space() };
         if N < len {
@@ -592,6 +659,11 @@ impl<T, L: IndexType, const N: usize> Allocator<T, L, N> {
     /// Allocate a single element from an existing value.
     pub fn alloc_value(&mut self, value: T) -> ArcSingle<T, L> {
         self.alloc_single(|| value)
+    }
+
+    /// Allocate a zero-length slice, which returns a handle that points to an empty slice without modifying the chunk.
+    pub fn alloc_empty() -> ArcSlice<T, L> {
+        ArcSlice::empty()
     }
 }
 
